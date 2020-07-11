@@ -15,6 +15,7 @@ class ContractLine(models.Model):
     _name = 'contract.line'
     _description = "Contract Line"
     _inherit = 'contract.abstract.contract.line'
+    _order = 'sequence,id'
 
     sequence = fields.Integer(
         string="Sequence",
@@ -30,6 +31,10 @@ class ContractLine(models.Model):
     analytic_account_id = fields.Many2one(
         string="Analytic account",
         comodel_name='account.analytic.account',
+    )
+    analytic_tag_ids = fields.Many2many(
+        comodel_name='account.analytic.tag',
+        string='Analytic Tags',
     )
     date_start = fields.Date(
         string='Date Start',
@@ -142,6 +147,9 @@ class ContractLine(models.Model):
     def _compute_state(self):
         today = fields.Date.context_today(self)
         for rec in self:
+            if rec.display_type:
+                rec.state = False
+                continue
             if rec.is_canceled:
                 rec.state = 'canceled'
                 continue
@@ -244,6 +252,8 @@ class ContractLine(models.Model):
             ]
         if state == 'canceled':
             return [('is_canceled', '=', True)]
+        if not state:
+            return [('display_type', '!=', False)]
 
     @api.model
     def _search_state(self, operator, value):
@@ -254,11 +264,8 @@ class ContractLine(models.Model):
             'upcoming-close',
             'closed',
             'canceled',
+            False,
         ]
-        if operator == '!=' and not value:
-            return []
-        if operator == '=' and not value:
-            return [('id', '=', False)]
         if operator == '=':
             return self._get_state_domain(value)
         if operator == '!=':
@@ -271,8 +278,6 @@ class ContractLine(models.Model):
             return domain
         if operator == 'in':
             domain = []
-            if not value:
-                return [('id', '=', False)]
             for state in value:
                 if domain:
                     domain.insert(0, '|')
@@ -280,6 +285,8 @@ class ContractLine(models.Model):
             return domain
 
         if operator == 'not in':
+            if set(value) == set(states):
+                return [('id', '=', False)]
             return self._search_state(
                 'in', [state for state in states if state not in value]
             )
@@ -292,9 +299,19 @@ class ContractLine(models.Model):
         'successor_contract_line_id',
         'predecessor_contract_line_id',
         'is_canceled',
+        'contract_id.is_terminated',
     )
     def _compute_allowed(self):
         for rec in self:
+            if rec.contract_id.is_terminated:
+                rec.update({
+                    'is_plan_successor_allowed': False,
+                    'is_stop_plan_successor_allowed': False,
+                    'is_stop_allowed': False,
+                    'is_cancel_allowed': False,
+                    'is_un_cancel_allowed': False,
+                })
+                continue
             if rec.date_start:
                 allowed = get_allowed(
                     rec.date_start,
@@ -306,13 +323,14 @@ class ContractLine(models.Model):
                     rec.is_canceled,
                 )
                 if allowed:
-                    rec.is_plan_successor_allowed = allowed.plan_successor
-                    rec.is_stop_plan_successor_allowed = (
-                        allowed.stop_plan_successor
-                    )
-                    rec.is_stop_allowed = allowed.stop
-                    rec.is_cancel_allowed = allowed.cancel
-                    rec.is_un_cancel_allowed = allowed.uncancel
+                    rec.update({
+                        'is_plan_successor_allowed': allowed.plan_successor,
+                        'is_stop_plan_successor_allowed':
+                            allowed.stop_plan_successor,
+                        'is_stop_allowed': allowed.stop,
+                        'is_cancel_allowed': allowed.cancel,
+                        'is_un_cancel_allowed': allowed.uncancel,
+                    })
 
     @api.constrains('is_auto_renew', 'successor_contract_line_id', 'date_end')
     def _check_allowed(self):
@@ -540,7 +558,7 @@ class ContractLine(models.Model):
     def _onchange_date_start(self):
         for rec in self.filtered('date_start'):
             rec.recurring_next_date = self.get_next_invoice_date(
-                rec.date_start,
+                rec.next_period_date_start,
                 rec.recurring_invoicing_type,
                 rec.recurring_invoicing_offset,
                 rec.recurring_rule_type,
@@ -569,7 +587,9 @@ class ContractLine(models.Model):
                         % line.name
                     )
 
-    @api.constrains('date_start', 'date_end', 'last_date_invoiced')
+    @api.constrains(
+        'date_start', 'date_end', 'last_date_invoiced', 'recurring_next_date'
+    )
     def _check_last_date_invoiced(self):
         for rec in self.filtered('last_date_invoiced'):
             if rec.date_start and rec.date_start > rec.last_date_invoiced:
@@ -585,6 +605,17 @@ class ContractLine(models.Model):
                     _(
                         "You can't have the end date before the date of last "
                         "invoice for the contract line '%s'"
+                    )
+                    % rec.name
+                )
+            if (
+                rec.recurring_next_date
+                and rec.recurring_next_date <= rec.last_date_invoiced
+            ):
+                raise ValidationError(
+                    _(
+                        "You can't have the next invoice date before the date "
+                        "of last invoice for the contract line '%s'"
                     )
                     % rec.name
                 )
@@ -620,23 +651,24 @@ class ContractLine(models.Model):
 
     @api.depends('recurring_next_date', 'date_start', 'date_end')
     def _compute_create_invoice_visibility(self):
+        # TODO: depending on the lines, and their order, some sections
+        # have no meaning in certain invoices
         today = fields.Date.context_today(self)
         for rec in self:
-            if rec.date_start:
-                if today < rec.date_start:
-                    rec.create_invoice_visibility = False
-                else:
-                    rec.create_invoice_visibility = bool(
-                        rec.recurring_next_date
-                    )
+            if ((not rec.display_type or rec.is_recurring_note)
+                    and rec.date_start and today >= rec.date_start):
+                rec.create_invoice_visibility = bool(rec.recurring_next_date)
+            else:
+                rec.create_invoice_visibility = False
 
     @api.multi
-    def _prepare_invoice_line(self, invoice_id=False):
+    def _prepare_invoice_line(self, invoice_id=False, invoice_values=False):
         self.ensure_one()
         dates = self._get_period_to_invoice(
             self.last_date_invoiced, self.recurring_next_date
         )
         invoice_line_vals = {
+            'display_type': self.display_type,
             'product_id': self.product_id.id,
             'quantity': self._get_quantity_to_invoice(*dates),
             'uom_id': self.uom_id.id,
@@ -645,7 +677,14 @@ class ContractLine(models.Model):
         }
         if invoice_id:
             invoice_line_vals['invoice_id'] = invoice_id.id
-        invoice_line = self.env['account.invoice.line'].new(invoice_line_vals)
+        invoice_line = self.env['account.invoice.line'].with_context(
+            force_company=self.contract_id.company_id.id,
+        ).new(invoice_line_vals)
+        if invoice_values and not invoice_id:
+            invoice = self.env['account.invoice'].with_context(
+                force_company=self.contract_id.company_id.id,
+            ).new(invoice_values)
+            invoice_line.invoice_id = invoice
         # Get other invoice line values from product onchange
         invoice_line._onchange_product_id()
         invoice_line_vals = invoice_line._convert_to_write(invoice_line._cache)
@@ -653,8 +692,10 @@ class ContractLine(models.Model):
         name = self._insert_markers(dates[0], dates[1])
         invoice_line_vals.update(
             {
+                'sequence': self.sequence,
                 'name': name,
                 'account_analytic_id': self.analytic_account_id.id,
+                'analytic_tag_ids': [(6, 0, self.analytic_tag_ids.ids)],
                 'price_unit': self.price_unit,
             }
         )
@@ -758,6 +799,10 @@ class ContractLine(models.Model):
             return relativedelta(months=interval)
         elif recurring_rule_type == 'monthlylastday':
             return relativedelta(months=interval, day=1)
+        elif recurring_rule_type == 'quarterly':
+            return relativedelta(months=3 * interval)
+        elif recurring_rule_type == 'semesterly':
+            return relativedelta(months=6 * interval)
         else:
             return relativedelta(years=interval)
 
@@ -796,6 +841,23 @@ class ContractLine(models.Model):
             })
 
     @api.multi
+    def _prepare_value_for_stop(self, date_end, manual_renew_needed):
+        self.ensure_one()
+        return {
+            'date_end': date_end,
+            'is_auto_renew': False,
+            'manual_renew_needed': manual_renew_needed,
+            'recurring_next_date': self.get_next_invoice_date(
+                self.next_period_date_start,
+                self.recurring_invoicing_type,
+                self.recurring_invoicing_offset,
+                self.recurring_rule_type,
+                self.recurring_interval,
+                max_date_end=date_end,
+            ),
+        }
+
+    @api.multi
     def stop(self, date_end, manual_renew_needed=False, post_message=True):
         """
         Put date_end on contract line
@@ -811,14 +873,11 @@ class ContractLine(models.Model):
             else:
                 if not rec.date_end or rec.date_end > date_end:
                     old_date_end = rec.date_end
-                    values = {
-                        'date_end': date_end,
-                        'is_auto_renew': False,
-                        'manual_renew_needed': manual_renew_needed,
-                    }
-                    if rec.last_date_invoiced == date_end:
-                        values['recurring_next_date'] = False
-                    rec.write(values)
+                    rec.write(
+                        rec._prepare_value_for_stop(
+                            date_end, manual_renew_needed
+                        )
+                    )
                     if post_message:
                         msg = _(
                             """Contract line for <strong>{product}</strong>
@@ -1124,7 +1183,7 @@ class ContractLine(models.Model):
         ).id
         return {
             'type': 'ir.actions.act_window',
-            'name': 'Resiliate contract line',
+            'name': 'Terminate contract line',
             'res_model': 'contract.line.wizard',
             'view_type': 'form',
             'view_mode': 'form',
@@ -1156,25 +1215,43 @@ class ContractLine(models.Model):
         }
 
     @api.multi
-    def _get_renewal_dates(self):
+    def _get_renewal_new_date_end(self):
         self.ensure_one()
         date_start = self.date_end + relativedelta(days=1)
         date_end = self._get_first_date_end(
             date_start, self.auto_renew_rule_type, self.auto_renew_interval
         )
-        return date_start, date_end
+        return date_end
+
+    @api.multi
+    def _renew_create_line(self, date_end):
+        self.ensure_one()
+        date_start = self.date_end + relativedelta(days=1)
+        is_auto_renew = self.is_auto_renew
+        self.stop(self.date_end, post_message=False)
+        new_line = self.plan_successor(
+            date_start, date_end, is_auto_renew, post_message=False
+        )
+        new_line._onchange_date_start()
+        return new_line
+
+    @api.multi
+    def _renew_extend_line(self, date_end):
+        self.ensure_one()
+        self.date_end = date_end
+        return self
 
     @api.multi
     def renew(self):
         res = self.env['contract.line']
         for rec in self:
-            is_auto_renew = rec.is_auto_renew
-            rec.stop(rec.date_end, post_message=False)
-            date_start, date_end = rec._get_renewal_dates()
-            new_line = rec.plan_successor(
-                date_start, date_end, is_auto_renew, post_message=False
-            )
-            new_line._onchange_date_start()
+            company = rec.contract_id.company_id
+            date_end = rec._get_renewal_new_date_end()
+            date_start = rec.date_end + relativedelta(days=1)
+            if company.create_new_line_at_contract_line_renew:
+                new_line = rec._renew_create_line(date_end)
+            else:
+                new_line = rec._renew_extend_line(date_end)
             res |= new_line
             msg = _(
                 """Contract line for <strong>{product}</strong>
@@ -1194,6 +1271,7 @@ class ContractLine(models.Model):
     @api.model
     def _contract_line_to_renew_domain(self):
         return [
+            ('contract_id.is_terminated', '=', False),
             ('is_auto_renew', '=', True),
             ('is_canceled', '=', False),
             ('termination_notice_date', '<=', fields.Date.context_today(self)),
@@ -1230,10 +1308,11 @@ class ContractLine(models.Model):
     @api.multi
     def unlink(self):
         """stop unlink uncnacled lines"""
-        if not all(self.mapped('is_canceled')):
-            raise ValidationError(
-                _("Contract line must be canceled before delete")
-            )
+        for record in self:
+            if not (record.is_canceled or record.display_type):
+                raise ValidationError(
+                    _("Contract line must be canceled before delete")
+                )
         return super().unlink()
 
     @api.multi
